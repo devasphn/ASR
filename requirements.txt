@@ -12,7 +12,7 @@ librosa==0.10.1
 soundfile==0.12.1
 webrtcvad==1.0.3
 pysilero-vad==2.1.0
-silero-vad-fork==3.4.0
+silero-vad
 aiortc==1.6.0
 av==10.0.0
 asyncio-mqtt==0.13.0
