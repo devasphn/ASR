@@ -19,6 +19,9 @@ import time
 from datetime import datetime
 import os
 from contextlib import asynccontextmanager
+from pydub import AudioSegment
+import tempfile
+import librosa
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -114,26 +117,35 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Audio processing functions
+# Fixed audio processing functions
 def process_audio_chunk(audio_data: bytes) -> np.ndarray:
-    """Convert audio bytes to numpy array for processing"""
+    """Convert WebM audio bytes to numpy array for processing"""
     try:
         # Decode base64 audio data
         audio_bytes = base64.b64decode(audio_data)
         
+        # Create BytesIO object for pydub
+        audio_io = io.BytesIO(audio_bytes)
+        
+        # Use pydub to handle WebM/Opus format
+        audio_segment = AudioSegment.from_file(audio_io, format="webm")
+        
+        # Convert to mono if stereo
+        if audio_segment.channels > 1:
+            audio_segment = audio_segment.set_channels(1)
+        
+        # Set sample rate to 16kHz
+        audio_segment = audio_segment.set_frame_rate(16000)
+        
         # Convert to numpy array
-        audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes))
+        audio_array = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
         
-        # Ensure mono audio
-        if len(audio_array.shape) > 1:
-            audio_array = np.mean(audio_array, axis=1)
-        
-        # Resample to 16kHz if needed
-        if sample_rate != 16000:
-            import librosa
-            audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+        # Normalize audio
+        if len(audio_array) > 0:
+            audio_array = audio_array / np.max(np.abs(audio_array))
             
-        return audio_array.astype(np.float32)
+        return audio_array
+        
     except Exception as e:
         logger.error(f"Error processing audio chunk: {e}")
         return np.array([])
@@ -144,29 +156,32 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
         if len(audio_array) == 0:
             return False
             
-        # Ensure audio is correct length for VAD
-        chunk_size = 512  # Typical chunk size for 16kHz
-        if len(audio_array) < chunk_size:
+        # Ensure we have enough samples for VAD
+        min_samples = 512
+        if len(audio_array) < min_samples:
             # Pad with zeros
-            audio_array = np.pad(audio_array, (0, chunk_size - len(audio_array)))
-        elif len(audio_array) > chunk_size:
-            # Take multiple chunks and average
-            chunks = [audio_array[i:i+chunk_size] for i in range(0, len(audio_array), chunk_size)]
-            vad_scores = []
-            
-            for chunk in chunks:
-                if len(chunk) == chunk_size:
-                    audio_bytes = (chunk * 32767).astype(np.int16).tobytes()
-                    vad_scores.append(vad_detector(audio_bytes))
-            
-            return np.mean(vad_scores) >= 0.5 if vad_scores else False
-            
-        # Convert to bytes
-        audio_bytes = (audio_array * 32767).astype(np.int16).tobytes()
+            audio_array = np.pad(audio_array, (0, min_samples - len(audio_array)))
         
-        # Detect voice activity
-        vad_score = vad_detector(audio_bytes)
-        return vad_score >= 0.5
+        # Process in chunks for better VAD performance
+        chunk_size = 512
+        vad_scores = []
+        
+        for i in range(0, len(audio_array), chunk_size):
+            chunk = audio_array[i:i + chunk_size]
+            
+            if len(chunk) < chunk_size:
+                chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+            
+            # Convert to int16 for VAD
+            audio_int16 = (chunk * 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+            
+            # Get VAD score
+            vad_score = vad_detector(audio_bytes)
+            vad_scores.append(vad_score)
+        
+        # Return True if average VAD score is above threshold
+        return np.mean(vad_scores) >= 0.5 if vad_scores else False
         
     except Exception as e:
         logger.error(f"Error in VAD detection: {e}")
@@ -178,15 +193,18 @@ async def transcribe_audio(audio_array: np.ndarray) -> str:
         if len(audio_array) == 0:
             return ""
             
+        # Ensure audio is float32 and properly normalized
+        audio_array = audio_array.astype(np.float32)
+        
         # Transcribe with WhisperX
         result = model.transcribe(audio_array, batch_size=batch_size)
         
-        # Align transcript
-        if align_model is not None and result["segments"]:
+        # Align transcript if alignment model is available
+        if align_model is not None and result.get("segments"):
             result = whisperx.align(result["segments"], align_model, metadata, 
                                  audio_array, device, return_char_alignments=False)
         
-        # Extract text
+        # Extract text from segments
         text = ""
         if "segments" in result:
             for segment in result["segments"]:
@@ -223,25 +241,29 @@ async def continuous_transcription(client_id: str):
                         # Check for voice activity
                         if detect_voice_activity(audio_array):
                             audio_buffer.extend(audio_array)
+                            logger.info(f"Voice detected, buffer size: {len(audio_buffer)}")
                             
                 except queue.Empty:
                     break
                     
-            # Transcribe if buffer has enough audio (1 second worth)
-            if len(audio_buffer) >= 16000:  # 1 second at 16kHz
+            # Transcribe if buffer has enough audio (2 seconds worth)
+            if len(audio_buffer) >= 32000:  # 2 seconds at 16kHz
                 current_time = time.time()
                 
-                # Transcribe every 2 seconds or when buffer is large
-                if (current_time - last_transcription_time >= 2.0 or 
-                    len(audio_buffer) >= 48000):  # 3 seconds
+                # Transcribe every 3 seconds or when buffer is large
+                if (current_time - last_transcription_time >= 3.0 or 
+                    len(audio_buffer) >= 64000):  # 4 seconds
                     
                     # Convert to numpy array
                     audio_array = np.array(audio_buffer, dtype=np.float32)
+                    
+                    logger.info(f"Transcribing audio buffer of size: {len(audio_array)}")
                     
                     # Transcribe
                     text = await transcribe_audio(audio_array)
                     
                     if text:
+                        logger.info(f"Transcription result: {text}")
                         # Send transcription result
                         await manager.send_personal_message({
                             "type": "transcription",
@@ -428,7 +450,7 @@ async def get_index():
                         isRecording = false;
                     };
                     
-                    // Setup MediaRecorder
+                    // Setup MediaRecorder with WebM format
                     const options = {
                         mimeType: 'audio/webm;codecs=opus',
                         audioBitsPerSecond: 16000
@@ -451,7 +473,7 @@ async def get_index():
                         }
                     };
                     
-                    mediaRecorder.start(500); // Send data every 500ms
+                    mediaRecorder.start(1000); // Send data every 1 second
                     
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
