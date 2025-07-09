@@ -18,22 +18,11 @@ import threading
 import time
 from datetime import datetime
 import os
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Initialize FastAPI app
-app = FastAPI(title="Real-Time STT API", version="1.0.0")
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Global variables
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,6 +32,51 @@ model = None
 align_model = None
 metadata = None
 vad_detector = None
+
+# Initialize models
+def initialize_models():
+    global model, align_model, metadata, vad_detector
+    
+    try:
+        # Initialize WhisperX model
+        logger.info("Loading WhisperX model...")
+        model = whisperx.load_model("large-v2", device, compute_type=compute_type)
+        
+        # Initialize alignment model
+        logger.info("Loading alignment model...")
+        align_model, metadata = whisperx.load_align_model(language_code="en", device=device)
+        
+        # Initialize Silero VAD
+        logger.info("Loading Silero VAD...")
+        vad_detector = SileroVoiceActivityDetector()
+        
+        logger.info("All models loaded successfully!")
+        
+    except Exception as e:
+        logger.error(f"Error initializing models: {e}")
+        raise
+
+# Modern lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    initialize_models()
+    yield
+    # Shutdown (cleanup if needed)
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(title="Real-Time STT API", version="1.0.0", lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Connection manager for WebSocket connections
 class ConnectionManager:
@@ -80,29 +114,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Initialize models
-def initialize_models():
-    global model, align_model, metadata, vad_detector
-    
-    try:
-        # Initialize WhisperX model
-        logger.info("Loading WhisperX model...")
-        model = whisperx.load_model("large-v2", device, compute_type=compute_type)
-        
-        # Initialize alignment model
-        logger.info("Loading alignment model...")
-        align_model, metadata = whisperx.load_align_model(language_code="en", device=device)
-        
-        # Initialize Silero VAD
-        logger.info("Loading Silero VAD...")
-        vad_detector = SileroVoiceActivityDetector()
-        
-        logger.info("All models loaded successfully!")
-        
-    except Exception as e:
-        logger.error(f"Error initializing models: {e}")
-        raise
-
 # Audio processing functions
 def process_audio_chunk(audio_data: bytes) -> np.ndarray:
     """Convert audio bytes to numpy array for processing"""
@@ -113,12 +124,16 @@ def process_audio_chunk(audio_data: bytes) -> np.ndarray:
         # Convert to numpy array
         audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes))
         
+        # Ensure mono audio
+        if len(audio_array.shape) > 1:
+            audio_array = np.mean(audio_array, axis=1)
+        
         # Resample to 16kHz if needed
         if sample_rate != 16000:
             import librosa
             audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
             
-        return audio_array
+        return audio_array.astype(np.float32)
     except Exception as e:
         logger.error(f"Error processing audio chunk: {e}")
         return np.array([])
@@ -129,14 +144,22 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
         if len(audio_array) == 0:
             return False
             
-        # Ensure audio is correct length for VAD (512 samples for 16kHz)
-        chunk_size = vad_detector.chunk_samples()
+        # Ensure audio is correct length for VAD
+        chunk_size = 512  # Typical chunk size for 16kHz
         if len(audio_array) < chunk_size:
             # Pad with zeros
             audio_array = np.pad(audio_array, (0, chunk_size - len(audio_array)))
         elif len(audio_array) > chunk_size:
-            # Take first chunk
-            audio_array = audio_array[:chunk_size]
+            # Take multiple chunks and average
+            chunks = [audio_array[i:i+chunk_size] for i in range(0, len(audio_array), chunk_size)]
+            vad_scores = []
+            
+            for chunk in chunks:
+                if len(chunk) == chunk_size:
+                    audio_bytes = (chunk * 32767).astype(np.int16).tobytes()
+                    vad_scores.append(vad_detector(audio_bytes))
+            
+            return np.mean(vad_scores) >= 0.5 if vad_scores else False
             
         # Convert to bytes
         audio_bytes = (audio_array * 32767).astype(np.int16).tobytes()
@@ -253,125 +276,196 @@ async def get_index():
                 max-width: 800px;
                 margin: 0 auto;
                 padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                background-color: white;
+                border-radius: 8px;
+                padding: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                text-align: center;
             }
             #transcription {
-                border: 1px solid #ccc;
+                border: 1px solid #ddd;
                 padding: 20px;
                 min-height: 200px;
                 margin: 20px 0;
                 background-color: #f9f9f9;
+                border-radius: 4px;
+                max-height: 400px;
+                overflow-y: auto;
             }
             button {
-                padding: 10px 20px;
+                padding: 12px 24px;
                 margin: 10px;
                 font-size: 16px;
                 cursor: pointer;
+                border: none;
+                border-radius: 4px;
+                transition: background-color 0.3s;
             }
             #startBtn {
                 background-color: #4CAF50;
                 color: white;
-                border: none;
-                border-radius: 4px;
+            }
+            #startBtn:hover {
+                background-color: #45a049;
             }
             #stopBtn {
                 background-color: #f44336;
                 color: white;
-                border: none;
-                border-radius: 4px;
+            }
+            #stopBtn:hover {
+                background-color: #da190b;
             }
             #status {
                 margin: 10px 0;
                 padding: 10px;
                 border-radius: 4px;
+                font-weight: bold;
             }
             .recording {
                 background-color: #ffeb3b;
                 color: #333;
+                border-left: 4px solid #ff9800;
             }
             .stopped {
                 background-color: #e0e0e0;
                 color: #666;
+                border-left: 4px solid #9e9e9e;
+            }
+            .connected {
+                background-color: #c8e6c9;
+                color: #2e7d32;
+                border-left: 4px solid #4caf50;
+            }
+            .error {
+                background-color: #ffcdd2;
+                color: #c62828;
+                border-left: 4px solid #f44336;
             }
         </style>
     </head>
     <body>
-        <h1>Real-Time Speech-to-Text</h1>
-        <div id="status" class="stopped">Status: Stopped</div>
-        <button id="startBtn" onclick="startRecording()">Start Recording</button>
-        <button id="stopBtn" onclick="stopRecording()" disabled>Stop Recording</button>
-        <div id="transcription"></div>
+        <div class="container">
+            <h1>🎤 Real-Time Speech-to-Text</h1>
+            <div id="status" class="stopped">Status: Stopped</div>
+            <button id="startBtn" onclick="startRecording()">Start Recording</button>
+            <button id="stopBtn" onclick="stopRecording()" disabled>Stop Recording</button>
+            <div id="transcription"></div>
+        </div>
         
         <script>
             let mediaRecorder;
             let websocket;
             let clientId = 'client_' + Date.now();
+            let isRecording = false;
+            
+            // Auto-detect WebSocket URL based on current location
+            function getWebSocketURL() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const hostname = window.location.hostname;
+                const port = window.location.port ? ':' + window.location.port : '';
+                
+                // For RunPod proxy, use the same host with wss
+                return `${protocol}//${hostname}${port}/ws/${clientId}`;
+            }
+            
+            function updateStatus(message, className) {
+                const statusElement = document.getElementById('status');
+                statusElement.textContent = message;
+                statusElement.className = className;
+            }
             
             async function startRecording() {
                 try {
+                    // Get microphone access
                     const stream = await navigator.mediaDevices.getUserMedia({
                         audio: {
                             sampleRate: 16000,
                             channelCount: 1,
                             echoCancellation: true,
-                            noiseSuppression: true
+                            noiseSuppression: true,
+                            autoGainControl: true
                         }
                     });
                     
+                    updateStatus('Status: Connecting...', 'recording');
+                    
                     // Connect WebSocket
-                    websocket = new WebSocket(`ws://localhost:8000/ws/${clientId}`);
+                    const wsUrl = getWebSocketURL();
+                    console.log('Connecting to:', wsUrl);
+                    websocket = new WebSocket(wsUrl);
                     
                     websocket.onopen = function(event) {
                         console.log('WebSocket connected');
+                        updateStatus('Status: Connected and Recording', 'connected');
+                        isRecording = true;
                     };
                     
                     websocket.onmessage = function(event) {
                         const data = JSON.parse(event.data);
                         if (data.type === 'transcription') {
-                            document.getElementById('transcription').innerHTML += 
-                                `<p><strong>${data.timestamp}:</strong> ${data.text}</p>`;
+                            const transcriptionDiv = document.getElementById('transcription');
+                            const timestamp = new Date(data.timestamp).toLocaleTimeString();
+                            transcriptionDiv.innerHTML += 
+                                `<p><strong>[${timestamp}]:</strong> ${data.text}</p>`;
+                            transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
                         }
                     };
                     
                     websocket.onerror = function(error) {
                         console.error('WebSocket error:', error);
+                        updateStatus('Status: Connection Error', 'error');
+                    };
+                    
+                    websocket.onclose = function(event) {
+                        console.log('WebSocket closed:', event.code, event.reason);
+                        updateStatus('Status: Disconnected', 'stopped');
+                        isRecording = false;
                     };
                     
                     // Setup MediaRecorder
-                    mediaRecorder = new MediaRecorder(stream, {
-                        mimeType: 'audio/webm;codecs=opus'
-                    });
+                    const options = {
+                        mimeType: 'audio/webm;codecs=opus',
+                        audioBitsPerSecond: 16000
+                    };
+                    
+                    mediaRecorder = new MediaRecorder(stream, options);
                     
                     mediaRecorder.ondataavailable = function(event) {
-                        if (event.data.size > 0) {
+                        if (event.data.size > 0 && websocket.readyState === WebSocket.OPEN) {
                             const reader = new FileReader();
                             reader.onload = function() {
                                 const arrayBuffer = reader.result;
                                 const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-                                if (websocket.readyState === WebSocket.OPEN) {
-                                    websocket.send(JSON.stringify({
-                                        type: 'audio',
-                                        data: base64
-                                    }));
-                                }
+                                websocket.send(JSON.stringify({
+                                    type: 'audio',
+                                    data: base64
+                                }));
                             };
                             reader.readAsArrayBuffer(event.data);
                         }
                     };
                     
-                    mediaRecorder.start(1000); // Send data every 1 second
+                    mediaRecorder.start(500); // Send data every 500ms
                     
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
-                    document.getElementById('status').className = 'recording';
-                    document.getElementById('status').textContent = 'Status: Recording...';
                     
                 } catch (error) {
                     console.error('Error starting recording:', error);
-                    alert('Error accessing microphone. Please check permissions.');
+                    updateStatus('Status: Error - ' + error.message, 'error');
+                    alert('Error accessing microphone. Please check permissions and try again.');
                 }
             }
             
             function stopRecording() {
+                isRecording = false;
+                
                 if (mediaRecorder && mediaRecorder.state !== 'inactive') {
                     mediaRecorder.stop();
                     mediaRecorder.stream.getTracks().forEach(track => track.stop());
@@ -383,9 +477,15 @@ async def get_index():
                 
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('stopBtn').disabled = true;
-                document.getElementById('status').className = 'stopped';
-                document.getElementById('status').textContent = 'Status: Stopped';
+                updateStatus('Status: Stopped', 'stopped');
             }
+            
+            // Handle page unload
+            window.addEventListener('beforeunload', function(e) {
+                if (isRecording) {
+                    stopRecording();
+                }
+            });
         </script>
     </body>
     </html>
@@ -425,11 +525,6 @@ async def health_check():
         "models_loaded": model is not None,
         "timestamp": datetime.now().isoformat()
     }
-
-# Initialize models on startup
-@app.on_event("startup")
-async def startup_event():
-    initialize_models()
 
 if __name__ == "__main__":
     import uvicorn
