@@ -11,7 +11,6 @@ import logging
 from typing import Dict, List
 import base64
 import io
-import wave
 from pysilero_vad import SileroVoiceActivityDetector
 import queue
 import threading
@@ -19,12 +18,14 @@ import time
 from datetime import datetime
 import os
 from contextlib import asynccontextmanager
-import struct
-import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Enable TF32 for better performance
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # Global variables
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -40,9 +41,9 @@ def initialize_models():
     global model, align_model, metadata, vad_detector
     
     try:
-        # Initialize WhisperX model
+        # Initialize WhisperX model with language specification
         logger.info("Loading WhisperX model...")
-        model = whisperx.load_model("large-v2", device, compute_type=compute_type)
+        model = whisperx.load_model("large-v2", device, compute_type=compute_type, language="en")
         
         # Initialize alignment model
         logger.info("Loading alignment model...")
@@ -124,7 +125,6 @@ def process_audio_chunk(audio_data: bytes) -> np.ndarray:
         audio_bytes = base64.b64decode(audio_data)
         
         # Convert raw PCM bytes to numpy array
-        # Assuming 16-bit PCM, mono, 16kHz
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
         
         # Convert to float32 and normalize
@@ -145,7 +145,6 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
         # Ensure we have enough samples for VAD
         min_samples = 512
         if len(audio_array) < min_samples:
-            # Pad with zeros
             audio_array = np.pad(audio_array, (0, min_samples - len(audio_array)))
         
         # Process in chunks for better VAD performance
@@ -166,7 +165,6 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
             vad_score = vad_detector(audio_bytes)
             vad_scores.append(vad_score)
         
-        # Return True if average VAD score is above threshold
         return np.mean(vad_scores) >= 0.5 if vad_scores else False
         
     except Exception as e:
@@ -179,10 +177,15 @@ async def transcribe_audio(audio_array: np.ndarray) -> str:
         if len(audio_array) == 0:
             return ""
             
+        # Ensure minimum audio length (pad if necessary)
+        min_length = 16000  # 1 second at 16kHz
+        if len(audio_array) < min_length:
+            audio_array = np.pad(audio_array, (0, min_length - len(audio_array)))
+            
         # Ensure audio is float32 and properly normalized
         audio_array = audio_array.astype(np.float32)
         
-        # Transcribe with WhisperX
+        # Transcribe with WhisperX (language already specified in model loading)
         result = model.transcribe(audio_array, batch_size=batch_size)
         
         # Align transcript if alignment model is available
@@ -227,18 +230,17 @@ async def continuous_transcription(client_id: str):
                         # Check for voice activity
                         if detect_voice_activity(audio_array):
                             audio_buffer.extend(audio_array)
-                            logger.info(f"Voice detected, buffer size: {len(audio_buffer)}")
                             
                 except queue.Empty:
                     break
                     
-            # Transcribe if buffer has enough audio (2 seconds worth)
-            if len(audio_buffer) >= 32000:  # 2 seconds at 16kHz
+            # Transcribe if buffer has enough audio (3 seconds worth for better accuracy)
+            if len(audio_buffer) >= 48000:  # 3 seconds at 16kHz
                 current_time = time.time()
                 
-                # Transcribe every 3 seconds or when buffer is large
-                if (current_time - last_transcription_time >= 3.0 or 
-                    len(audio_buffer) >= 64000):  # 4 seconds
+                # Transcribe every 4 seconds or when buffer is large
+                if (current_time - last_transcription_time >= 4.0 or 
+                    len(audio_buffer) >= 80000):  # 5 seconds
                     
                     # Convert to numpy array
                     audio_array = np.array(audio_buffer, dtype=np.float32)
@@ -369,41 +371,30 @@ async def get_index():
         <script>
             let audioContext;
             let audioWorkletNode;
-            let mediaStreamSource;
             let websocket;
             let clientId = 'client_' + Date.now();
             let isRecording = false;
             
             // AudioWorklet processor code
-            const processorCode = `
+            const audioWorkletCode = `
                 class AudioProcessor extends AudioWorkletProcessor {
-                    constructor() {
-                        super();
-                        this.port.onmessage = (event) => {
-                            if (event.data.type === 'init') {
-                                console.log('AudioWorklet initialized');
-                            }
-                        };
-                    }
-                    
                     process(inputs, outputs, parameters) {
                         const input = inputs[0];
                         if (input.length > 0) {
-                            const inputData = input[0];
+                            const inputChannel = input[0];
                             
                             // Convert float32 to int16
-                            const int16Array = new Int16Array(inputData.length);
-                            for (let i = 0; i < inputData.length; i++) {
-                                int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                            const int16Array = new Int16Array(inputChannel.length);
+                            for (let i = 0; i < inputChannel.length; i++) {
+                                int16Array[i] = Math.max(-32768, Math.min(32767, inputChannel[i] * 32768));
                             }
                             
                             // Send to main thread
                             this.port.postMessage({
-                                type: 'audioData',
+                                type: 'audio',
                                 data: int16Array
                             });
                         }
-                        
                         return true;
                     }
                 }
@@ -428,8 +419,6 @@ async def get_index():
             
             async function startRecording() {
                 try {
-                    updateStatus('Status: Connecting...', 'recording');
-                    
                     // Get microphone access
                     const stream = await navigator.mediaDevices.getUserMedia({
                         audio: {
@@ -441,19 +430,7 @@ async def get_index():
                         }
                     });
                     
-                    // Create AudioContext
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                        sampleRate: 16000
-                    });
-                    
-                    // Create AudioWorklet from blob
-                    const blob = new Blob([processorCode], { type: 'application/javascript' });
-                    const workletUrl = URL.createObjectURL(blob);
-                    
-                    await audioContext.audioWorklet.addModule(workletUrl);
-                    
-                    // Create AudioWorkletNode
-                    audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                    updateStatus('Status: Connecting...', 'recording');
                     
                     // Connect WebSocket
                     const wsUrl = getWebSocketURL();
@@ -488,10 +465,25 @@ async def get_index():
                         isRecording = false;
                     };
                     
-                    // Handle audio data from AudioWorklet
+                    // Setup Web Audio API with AudioWorklet
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: 16000
+                    });
+                    
+                    // Create AudioWorklet
+                    const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+                    const workletUrl = URL.createObjectURL(blob);
+                    
+                    await audioContext.audioWorklet.addModule(workletUrl);
+                    
+                    const source = audioContext.createMediaStreamSource(stream);
+                    audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                    
                     audioWorkletNode.port.onmessage = function(event) {
-                        if (event.data.type === 'audioData' && websocket.readyState === WebSocket.OPEN) {
+                        if (event.data.type === 'audio' && websocket.readyState === WebSocket.OPEN) {
+                            // Convert to base64
                             const base64 = btoa(String.fromCharCode(...new Uint8Array(event.data.data.buffer)));
+                            
                             websocket.send(JSON.stringify({
                                 type: 'audio',
                                 data: base64
@@ -499,12 +491,8 @@ async def get_index():
                         }
                     };
                     
-                    // Set up audio processing chain
-                    mediaStreamSource = audioContext.createMediaStreamSource(stream);
-                    mediaStreamSource.connect(audioWorkletNode);
-                    
-                    // Initialize AudioWorklet
-                    audioWorkletNode.port.postMessage({ type: 'init' });
+                    source.connect(audioWorkletNode);
+                    audioWorkletNode.connect(audioContext.destination);
                     
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
@@ -518,11 +506,6 @@ async def get_index():
             
             function stopRecording() {
                 isRecording = false;
-                
-                if (mediaStreamSource) {
-                    mediaStreamSource.disconnect();
-                    mediaStreamSource = null;
-                }
                 
                 if (audioWorkletNode) {
                     audioWorkletNode.disconnect();
