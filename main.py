@@ -85,13 +85,15 @@ app.add_middleware(
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        self.audio_buffers: Dict[str, queue.Queue] = {}
+        self.audio_buffers: Dict[str, List[np.ndarray]] = {}
         self.transcription_tasks: Dict[str, asyncio.Task] = {}
+        self.last_transcription_time: Dict[str, float] = {}
         
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         self.active_connections[client_id] = websocket
-        self.audio_buffers[client_id] = queue.Queue()
+        self.audio_buffers[client_id] = []
+        self.last_transcription_time[client_id] = time.time()
         logger.info(f"Client {client_id} connected")
         
     def disconnect(self, client_id: str):
@@ -102,6 +104,8 @@ class ConnectionManager:
         if client_id in self.transcription_tasks:
             self.transcription_tasks[client_id].cancel()
             del self.transcription_tasks[client_id]
+        if client_id in self.last_transcription_time:
+            del self.last_transcription_time[client_id]
         logger.info(f"Client {client_id} disconnected")
         
     async def send_personal_message(self, message: dict, client_id: str):
@@ -111,9 +115,9 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"Error sending message to {client_id}: {e}")
                 
-    def add_audio_chunk(self, client_id: str, audio_data: bytes):
+    def add_audio_chunk(self, client_id: str, audio_array: np.ndarray):
         if client_id in self.audio_buffers:
-            self.audio_buffers[client_id].put(audio_data)
+            self.audio_buffers[client_id].append(audio_array)
 
 manager = ConnectionManager()
 
@@ -130,6 +134,7 @@ def process_audio_chunk(audio_data: bytes) -> np.ndarray:
         # Convert to float32 and normalize
         audio_array = audio_array.astype(np.float32) / 32768.0
         
+        logger.debug(f"Processed audio chunk: {len(audio_array)} samples")
         return audio_array
         
     except Exception as e:
@@ -165,7 +170,13 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
             vad_score = vad_detector(audio_bytes)
             vad_scores.append(vad_score)
         
-        return np.mean(vad_scores) >= 0.5 if vad_scores else False
+        avg_vad_score = np.mean(vad_scores) if vad_scores else 0.0
+        has_voice = avg_vad_score >= 0.3  # Lowered threshold for better sensitivity
+        
+        if has_voice:
+            logger.debug(f"Voice detected! VAD score: {avg_vad_score:.3f}")
+        
+        return has_voice
         
     except Exception as e:
         logger.error(f"Error in VAD detection: {e}")
@@ -185,22 +196,33 @@ async def transcribe_audio(audio_array: np.ndarray) -> str:
         # Ensure audio is float32 and properly normalized
         audio_array = audio_array.astype(np.float32)
         
+        # Normalize audio if needed
+        if np.max(np.abs(audio_array)) > 0:
+            audio_array = audio_array / np.max(np.abs(audio_array))
+        
+        logger.info(f"Starting transcription of {len(audio_array)} samples")
+        
         # Transcribe with WhisperX (language already specified in model loading)
         result = model.transcribe(audio_array, batch_size=batch_size)
         
         # Align transcript if alignment model is available
         if align_model is not None and result.get("segments"):
-            result = whisperx.align(result["segments"], align_model, metadata, 
-                                 audio_array, device, return_char_alignments=False)
+            try:
+                result = whisperx.align(result["segments"], align_model, metadata, 
+                                     audio_array, device, return_char_alignments=False)
+            except Exception as e:
+                logger.warning(f"Alignment failed: {e}, using original result")
         
         # Extract text from segments
         text = ""
         if "segments" in result:
             for segment in result["segments"]:
                 if "text" in segment:
-                    text += segment["text"]
+                    text += segment["text"] + " "
                     
-        return text.strip()
+        final_text = text.strip()
+        logger.info(f"Transcription completed: '{final_text}'")
+        return final_text
         
     except Exception as e:
         logger.error(f"Error in transcription: {e}")
@@ -209,49 +231,49 @@ async def transcribe_audio(audio_array: np.ndarray) -> str:
 # Background transcription task
 async def continuous_transcription(client_id: str):
     """Continuously process audio chunks for transcription"""
-    audio_buffer = []
-    last_transcription_time = time.time()
     
     while client_id in manager.active_connections:
         try:
-            # Get audio chunks from buffer
-            audio_queue = manager.audio_buffers.get(client_id)
-            if not audio_queue or audio_queue.empty():
+            # Get current audio buffer
+            current_buffer = manager.audio_buffers.get(client_id, [])
+            
+            if len(current_buffer) == 0:
                 await asyncio.sleep(0.1)
                 continue
                 
-            # Process available audio chunks
-            while not audio_queue.empty():
-                try:
-                    audio_data = audio_queue.get_nowait()
-                    audio_array = process_audio_chunk(audio_data)
-                    
-                    if len(audio_array) > 0:
-                        # Check for voice activity
-                        if detect_voice_activity(audio_array):
-                            audio_buffer.extend(audio_array)
-                            
-                except queue.Empty:
-                    break
-                    
-            # Transcribe if buffer has enough audio (3 seconds worth for better accuracy)
-            if len(audio_buffer) >= 48000:  # 3 seconds at 16kHz
-                current_time = time.time()
+            # Process audio chunks with voice activity detection
+            voice_chunks = []
+            processed_chunks = 0
+            
+            for audio_chunk in current_buffer:
+                if detect_voice_activity(audio_chunk):
+                    voice_chunks.append(audio_chunk)
+                processed_chunks += 1
                 
-                # Transcribe every 4 seconds or when buffer is large
-                if (current_time - last_transcription_time >= 4.0 or 
-                    len(audio_buffer) >= 80000):  # 5 seconds
+            # Clear processed chunks
+            if processed_chunks > 0:
+                manager.audio_buffers[client_id] = current_buffer[processed_chunks:]
+                
+            # Check if we have enough voice data for transcription
+            if len(voice_chunks) >= 2:  # At least 2 chunks with voice
+                # Concatenate voice chunks
+                combined_audio = np.concatenate(voice_chunks)
+                
+                # Check timing constraint
+                current_time = time.time()
+                last_time = manager.last_transcription_time.get(client_id, 0)
+                
+                # Transcribe if we have enough audio (at least 2 seconds) and enough time has passed
+                if len(combined_audio) >= 32000 and (current_time - last_time) >= 2.0:
                     
-                    # Convert to numpy array
-                    audio_array = np.array(audio_buffer, dtype=np.float32)
-                    
-                    logger.info(f"Transcribing audio buffer of size: {len(audio_array)}")
+                    logger.info(f"Starting transcription for client {client_id} with {len(combined_audio)} samples")
                     
                     # Transcribe
-                    text = await transcribe_audio(audio_array)
+                    text = await transcribe_audio(combined_audio)
                     
-                    if text:
-                        logger.info(f"Transcription result: {text}")
+                    if text and text.strip():
+                        logger.info(f"Sending transcription to client {client_id}: '{text}'")
+                        
                         # Send transcription result
                         await manager.send_personal_message({
                             "type": "transcription",
@@ -259,10 +281,11 @@ async def continuous_transcription(client_id: str):
                             "timestamp": datetime.now().isoformat()
                         }, client_id)
                         
-                    # Clear buffer and update time
-                    audio_buffer = []
-                    last_transcription_time = current_time
-                    
+                        # Update last transcription time
+                        manager.last_transcription_time[client_id] = current_time
+                    else:
+                        logger.warning(f"Empty transcription result for client {client_id}")
+                        
                     # Clean up GPU memory
                     if device == "cuda":
                         torch.cuda.empty_cache()
@@ -357,6 +380,11 @@ async def get_index():
                 color: #c62828;
                 border-left: 4px solid #f44336;
             }
+            .debug {
+                background-color: #e1f5fe;
+                color: #0277bd;
+                border-left: 4px solid #03a9f4;
+            }
         </style>
     </head>
     <body>
@@ -365,7 +393,9 @@ async def get_index():
             <div id="status" class="stopped">Status: Stopped</div>
             <button id="startBtn" onclick="startRecording()">Start Recording</button>
             <button id="stopBtn" onclick="stopRecording()" disabled>Stop Recording</button>
-            <div id="transcription"></div>
+            <div id="transcription">
+                <p><em>Transcribed text will appear here...</em></p>
+            </div>
         </div>
         
         <script>
@@ -374,10 +404,17 @@ async def get_index():
             let websocket;
             let clientId = 'client_' + Date.now();
             let isRecording = false;
+            let audioChunkCounter = 0;
             
-            // AudioWorklet processor code
+            // AudioWorklet processor code with enhanced debugging
             const audioWorkletCode = `
                 class AudioProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.chunkCounter = 0;
+                        console.log('AudioWorklet processor initialized');
+                    }
+                    
                     process(inputs, outputs, parameters) {
                         const input = inputs[0];
                         if (input.length > 0) {
@@ -389,10 +426,19 @@ async def get_index():
                                 int16Array[i] = Math.max(-32768, Math.min(32767, inputChannel[i] * 32768));
                             }
                             
-                            // Send to main thread
+                            // Calculate RMS for debugging
+                            let rms = 0;
+                            for (let i = 0; i < inputChannel.length; i++) {
+                                rms += inputChannel[i] * inputChannel[i];
+                            }
+                            rms = Math.sqrt(rms / inputChannel.length);
+                            
+                            // Send to main thread with debug info
                             this.port.postMessage({
                                 type: 'audio',
-                                data: int16Array
+                                data: int16Array,
+                                rms: rms,
+                                counter: this.chunkCounter++
                             });
                         }
                         return true;
@@ -417,6 +463,14 @@ async def get_index():
                 statusElement.className = className;
             }
             
+            function addDebugMessage(message) {
+                const transcriptionDiv = document.getElementById('transcription');
+                const debugP = document.createElement('p');
+                debugP.innerHTML = `<small style="color: #666;">[DEBUG] ${message}</small>`;
+                transcriptionDiv.appendChild(debugP);
+                transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
+            }
+            
             async function startRecording() {
                 try {
                     // Get microphone access
@@ -431,15 +485,19 @@ async def get_index():
                     });
                     
                     updateStatus('Status: Connecting...', 'recording');
+                    addDebugMessage('Microphone access granted');
                     
                     // Connect WebSocket
                     const wsUrl = getWebSocketURL();
                     console.log('Connecting to:', wsUrl);
+                    addDebugMessage(`Connecting to: ${wsUrl}`);
+                    
                     websocket = new WebSocket(wsUrl);
                     
                     websocket.onopen = function(event) {
                         console.log('WebSocket connected');
                         updateStatus('Status: Connected and Recording', 'connected');
+                        addDebugMessage('WebSocket connected successfully');
                         isRecording = true;
                     };
                     
@@ -448,20 +506,25 @@ async def get_index():
                         if (data.type === 'transcription') {
                             const transcriptionDiv = document.getElementById('transcription');
                             const timestamp = new Date(data.timestamp).toLocaleTimeString();
-                            transcriptionDiv.innerHTML += 
-                                `<p><strong>[${timestamp}]:</strong> ${data.text}</p>`;
+                            const transcriptionP = document.createElement('p');
+                            transcriptionP.innerHTML = `<strong>[${timestamp}]:</strong> ${data.text}`;
+                            transcriptionDiv.appendChild(transcriptionP);
                             transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
+                            
+                            console.log('Transcription received:', data.text);
                         }
                     };
                     
                     websocket.onerror = function(error) {
                         console.error('WebSocket error:', error);
                         updateStatus('Status: Connection Error', 'error');
+                        addDebugMessage('WebSocket connection error');
                     };
                     
                     websocket.onclose = function(event) {
                         console.log('WebSocket closed:', event.code, event.reason);
                         updateStatus('Status: Disconnected', 'stopped');
+                        addDebugMessage('WebSocket connection closed');
                         isRecording = false;
                     };
                     
@@ -470,19 +533,30 @@ async def get_index():
                         sampleRate: 16000
                     });
                     
+                    addDebugMessage('AudioContext created');
+                    
                     // Create AudioWorklet
                     const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
                     const workletUrl = URL.createObjectURL(blob);
                     
                     await audioContext.audioWorklet.addModule(workletUrl);
+                    addDebugMessage('AudioWorklet module loaded');
                     
                     const source = audioContext.createMediaStreamSource(stream);
                     audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
                     
                     audioWorkletNode.port.onmessage = function(event) {
                         if (event.data.type === 'audio' && websocket.readyState === WebSocket.OPEN) {
+                            const { data: audioData, rms, counter } = event.data;
+                            
+                            // Debug logging
+                            audioChunkCounter++;
+                            if (audioChunkCounter % 50 === 0) {  // Log every 50 chunks
+                                addDebugMessage(`Sent ${audioChunkCounter} audio chunks, RMS: ${rms.toFixed(4)}`);
+                            }
+                            
                             // Convert to base64
-                            const base64 = btoa(String.fromCharCode(...new Uint8Array(event.data.data.buffer)));
+                            const base64 = btoa(String.fromCharCode(...new Uint8Array(audioData.buffer)));
                             
                             websocket.send(JSON.stringify({
                                 type: 'audio',
@@ -494,12 +568,15 @@ async def get_index():
                     source.connect(audioWorkletNode);
                     audioWorkletNode.connect(audioContext.destination);
                     
+                    addDebugMessage('Audio processing pipeline connected');
+                    
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
                     
                 } catch (error) {
                     console.error('Error starting recording:', error);
                     updateStatus('Status: Error - ' + error.message, 'error');
+                    addDebugMessage('Error: ' + error.message);
                     alert('Error accessing microphone. Please check permissions and try again.');
                 }
             }
@@ -510,20 +587,26 @@ async def get_index():
                 if (audioWorkletNode) {
                     audioWorkletNode.disconnect();
                     audioWorkletNode = null;
+                    addDebugMessage('AudioWorklet disconnected');
                 }
                 
                 if (audioContext) {
                     audioContext.close();
                     audioContext = null;
+                    addDebugMessage('AudioContext closed');
                 }
                 
                 if (websocket) {
                     websocket.close();
+                    addDebugMessage('WebSocket closed');
                 }
                 
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('stopBtn').disabled = true;
                 updateStatus('Status: Stopped', 'stopped');
+                
+                // Reset counters
+                audioChunkCounter = 0;
             }
             
             // Handle page unload
@@ -554,8 +637,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             if message.get("type") == "audio":
                 audio_data = message.get("data")
                 if audio_data:
-                    manager.add_audio_chunk(client_id, audio_data)
-                    
+                    # Process audio chunk
+                    audio_array = process_audio_chunk(audio_data)
+                    if len(audio_array) > 0:
+                        manager.add_audio_chunk(client_id, audio_array)
+                        
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
     except Exception as e:
