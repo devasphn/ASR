@@ -49,7 +49,7 @@ def initialize_models():
         logger.info("Loading alignment model...")
         align_model, metadata = whisperx.load_align_model(language_code="en", device=device)
         
-        # Initialize Silero VAD
+        # Initialize Silero VAD with lower threshold
         logger.info("Loading Silero VAD...")
         vad_detector = SileroVoiceActivityDetector()
         
@@ -121,9 +121,9 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Audio processing functions
+# Enhanced audio processing functions
 def process_audio_chunk(audio_data: bytes) -> np.ndarray:
-    """Process raw PCM audio data directly"""
+    """Process raw PCM audio data with proper normalization"""
     try:
         # Decode base64 audio data
         audio_bytes = base64.b64decode(audio_data)
@@ -131,10 +131,14 @@ def process_audio_chunk(audio_data: bytes) -> np.ndarray:
         # Convert raw PCM bytes to numpy array
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
         
-        # Convert to float32 and normalize
+        # Convert to float32 and normalize properly
         audio_array = audio_array.astype(np.float32) / 32768.0
         
-        logger.debug(f"Processed audio chunk: {len(audio_array)} samples")
+        # Debug: Calculate RMS to verify audio signal
+        rms = np.sqrt(np.mean(audio_array**2))
+        if rms > 0.001:  # Only log when there's actual audio
+            logger.debug(f"Audio chunk processed: {len(audio_array)} samples, RMS: {rms:.4f}")
+        
         return audio_array
         
     except Exception as e:
@@ -142,9 +146,14 @@ def process_audio_chunk(audio_data: bytes) -> np.ndarray:
         return np.array([])
 
 def detect_voice_activity(audio_array: np.ndarray) -> bool:
-    """Detect voice activity using Silero VAD"""
+    """Detect voice activity using Silero VAD with enhanced sensitivity"""
     try:
         if len(audio_array) == 0:
+            return False
+        
+        # Calculate RMS first for quick energy check
+        rms = np.sqrt(np.mean(audio_array**2))
+        if rms < 0.001:  # Very low energy threshold
             return False
             
         # Ensure we have enough samples for VAD
@@ -162,19 +171,20 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
             if len(chunk) < chunk_size:
                 chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
             
-            # Convert to int16 for VAD
-            audio_int16 = (chunk * 32767).astype(np.int16)
+            # Convert to int16 for VAD with proper scaling
+            audio_int16 = np.clip(chunk * 32767, -32767, 32767).astype(np.int16)
             audio_bytes = audio_int16.tobytes()
             
             # Get VAD score
             vad_score = vad_detector(audio_bytes)
             vad_scores.append(vad_score)
         
+        # Use lower threshold for better sensitivity
         avg_vad_score = np.mean(vad_scores) if vad_scores else 0.0
-        has_voice = avg_vad_score >= 0.3  # Lowered threshold for better sensitivity
+        has_voice = avg_vad_score >= 0.2  # Lowered from 0.3 to 0.2
         
         if has_voice:
-            logger.debug(f"Voice detected! VAD score: {avg_vad_score:.3f}")
+            logger.info(f"Voice detected! VAD score: {avg_vad_score:.3f}, RMS: {rms:.4f}")
         
         return has_voice
         
@@ -183,26 +193,27 @@ def detect_voice_activity(audio_array: np.ndarray) -> bool:
         return False
 
 async def transcribe_audio(audio_array: np.ndarray) -> str:
-    """Transcribe audio using WhisperX"""
+    """Transcribe audio using WhisperX with improved preprocessing"""
     try:
         if len(audio_array) == 0:
             return ""
             
-        # Ensure minimum audio length (pad if necessary)
-        min_length = 16000  # 1 second at 16kHz
+        # Ensure minimum audio length (1.5 seconds for better accuracy)
+        min_length = 24000  # 1.5 seconds at 16kHz
         if len(audio_array) < min_length:
             audio_array = np.pad(audio_array, (0, min_length - len(audio_array)))
             
         # Ensure audio is float32 and properly normalized
         audio_array = audio_array.astype(np.float32)
         
-        # Normalize audio if needed
-        if np.max(np.abs(audio_array)) > 0:
-            audio_array = audio_array / np.max(np.abs(audio_array))
+        # Apply gentle normalization if needed
+        max_val = np.max(np.abs(audio_array))
+        if max_val > 0:
+            audio_array = audio_array / max_val * 0.95  # Normalize to 95% to avoid clipping
         
-        logger.info(f"Starting transcription of {len(audio_array)} samples")
+        logger.info(f"Starting transcription of {len(audio_array)} samples, max_val: {max_val:.4f}")
         
-        # Transcribe with WhisperX (language already specified in model loading)
+        # Transcribe with WhisperX
         result = model.transcribe(audio_array, batch_size=batch_size)
         
         # Align transcript if alignment model is available
@@ -238,7 +249,7 @@ async def continuous_transcription(client_id: str):
             current_buffer = manager.audio_buffers.get(client_id, [])
             
             if len(current_buffer) == 0:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.2)  # Check every 200ms
                 continue
                 
             # Process audio chunks with voice activity detection
@@ -255,7 +266,7 @@ async def continuous_transcription(client_id: str):
                 manager.audio_buffers[client_id] = current_buffer[processed_chunks:]
                 
             # Check if we have enough voice data for transcription
-            if len(voice_chunks) >= 2:  # At least 2 chunks with voice
+            if len(voice_chunks) >= 3:  # At least 3 chunks with voice
                 # Concatenate voice chunks
                 combined_audio = np.concatenate(voice_chunks)
                 
@@ -263,8 +274,8 @@ async def continuous_transcription(client_id: str):
                 current_time = time.time()
                 last_time = manager.last_transcription_time.get(client_id, 0)
                 
-                # Transcribe if we have enough audio (at least 2 seconds) and enough time has passed
-                if len(combined_audio) >= 32000 and (current_time - last_time) >= 2.0:
+                # Transcribe if we have enough audio (at least 1.5 seconds) and enough time has passed
+                if len(combined_audio) >= 24000 and (current_time - last_time) >= 1.5:
                     
                     logger.info(f"Starting transcription for client {client_id} with {len(combined_audio)} samples")
                     
@@ -380,10 +391,11 @@ async def get_index():
                 color: #c62828;
                 border-left: 4px solid #f44336;
             }
-            .debug {
-                background-color: #e1f5fe;
-                color: #0277bd;
-                border-left: 4px solid #03a9f4;
+            .audio-level {
+                margin: 10px 0;
+                padding: 10px;
+                border-radius: 4px;
+                background-color: #f0f0f0;
             }
         </style>
     </head>
@@ -391,6 +403,7 @@ async def get_index():
         <div class="container">
             <h1>🎤 Real-Time Speech-to-Text</h1>
             <div id="status" class="stopped">Status: Stopped</div>
+            <div id="audioLevel" class="audio-level">Audio Level: 0.00</div>
             <button id="startBtn" onclick="startRecording()">Start Recording</button>
             <button id="stopBtn" onclick="stopRecording()" disabled>Stop Recording</button>
             <div id="transcription">
@@ -406,7 +419,7 @@ async def get_index():
             let isRecording = false;
             let audioChunkCounter = 0;
             
-            // AudioWorklet processor code with enhanced debugging
+            // AudioWorklet processor code with enhanced audio processing
             const audioWorkletCode = `
                 class AudioProcessor extends AudioWorkletProcessor {
                     constructor() {
@@ -420,18 +433,26 @@ async def get_index():
                         if (input.length > 0) {
                             const inputChannel = input[0];
                             
-                            // Convert float32 to int16
-                            const int16Array = new Int16Array(inputChannel.length);
+                            // Apply gain to boost signal
+                            const gainFactor = 2.0; // Increase gain
+                            const processedChannel = new Float32Array(inputChannel.length);
+                            
                             for (let i = 0; i < inputChannel.length; i++) {
-                                int16Array[i] = Math.max(-32768, Math.min(32767, inputChannel[i] * 32768));
+                                processedChannel[i] = Math.max(-1, Math.min(1, inputChannel[i] * gainFactor));
+                            }
+                            
+                            // Convert float32 to int16
+                            const int16Array = new Int16Array(processedChannel.length);
+                            for (let i = 0; i < processedChannel.length; i++) {
+                                int16Array[i] = Math.max(-32768, Math.min(32767, processedChannel[i] * 32767));
                             }
                             
                             // Calculate RMS for debugging
                             let rms = 0;
-                            for (let i = 0; i < inputChannel.length; i++) {
-                                rms += inputChannel[i] * inputChannel[i];
+                            for (let i = 0; i < processedChannel.length; i++) {
+                                rms += processedChannel[i] * processedChannel[i];
                             }
-                            rms = Math.sqrt(rms / inputChannel.length);
+                            rms = Math.sqrt(rms / processedChannel.length);
                             
                             // Send to main thread with debug info
                             this.port.postMessage({
@@ -463,41 +484,44 @@ async def get_index():
                 statusElement.className = className;
             }
             
-            function addDebugMessage(message) {
-                const transcriptionDiv = document.getElementById('transcription');
-                const debugP = document.createElement('p');
-                debugP.innerHTML = `<small style="color: #666;">[DEBUG] ${message}</small>`;
-                transcriptionDiv.appendChild(debugP);
-                transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
+            function updateAudioLevel(rms) {
+                const audioLevelElement = document.getElementById('audioLevel');
+                audioLevelElement.textContent = `Audio Level: ${rms.toFixed(4)}`;
+                
+                // Change background color based on audio level
+                if (rms > 0.01) {
+                    audioLevelElement.style.backgroundColor = '#c8e6c9';
+                } else if (rms > 0.001) {
+                    audioLevelElement.style.backgroundColor = '#fff3e0';
+                } else {
+                    audioLevelElement.style.backgroundColor = '#f0f0f0';
+                }
             }
             
             async function startRecording() {
                 try {
-                    // Get microphone access
+                    // Request microphone access with enhanced constraints
                     const stream = await navigator.mediaDevices.getUserMedia({
                         audio: {
                             sampleRate: 16000,
                             channelCount: 1,
                             echoCancellation: true,
                             noiseSuppression: true,
-                            autoGainControl: true
+                            autoGainControl: true,
+                            volume: 1.0
                         }
                     });
                     
                     updateStatus('Status: Connecting...', 'recording');
-                    addDebugMessage('Microphone access granted');
                     
                     // Connect WebSocket
                     const wsUrl = getWebSocketURL();
                     console.log('Connecting to:', wsUrl);
-                    addDebugMessage(`Connecting to: ${wsUrl}`);
-                    
                     websocket = new WebSocket(wsUrl);
                     
                     websocket.onopen = function(event) {
                         console.log('WebSocket connected');
                         updateStatus('Status: Connected and Recording', 'connected');
-                        addDebugMessage('WebSocket connected successfully');
                         isRecording = true;
                     };
                     
@@ -506,10 +530,12 @@ async def get_index():
                         if (data.type === 'transcription') {
                             const transcriptionDiv = document.getElementById('transcription');
                             const timestamp = new Date(data.timestamp).toLocaleTimeString();
+                            
+                            // Clear previous content and add new transcription
+                            transcriptionDiv.innerHTML = '';
                             const transcriptionP = document.createElement('p');
                             transcriptionP.innerHTML = `<strong>[${timestamp}]:</strong> ${data.text}`;
                             transcriptionDiv.appendChild(transcriptionP);
-                            transcriptionDiv.scrollTop = transcriptionDiv.scrollHeight;
                             
                             console.log('Transcription received:', data.text);
                         }
@@ -518,13 +544,11 @@ async def get_index():
                     websocket.onerror = function(error) {
                         console.error('WebSocket error:', error);
                         updateStatus('Status: Connection Error', 'error');
-                        addDebugMessage('WebSocket connection error');
                     };
                     
                     websocket.onclose = function(event) {
                         console.log('WebSocket closed:', event.code, event.reason);
                         updateStatus('Status: Disconnected', 'stopped');
-                        addDebugMessage('WebSocket connection closed');
                         isRecording = false;
                     };
                     
@@ -533,14 +557,11 @@ async def get_index():
                         sampleRate: 16000
                     });
                     
-                    addDebugMessage('AudioContext created');
-                    
                     // Create AudioWorklet
                     const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
                     const workletUrl = URL.createObjectURL(blob);
                     
                     await audioContext.audioWorklet.addModule(workletUrl);
-                    addDebugMessage('AudioWorklet module loaded');
                     
                     const source = audioContext.createMediaStreamSource(stream);
                     audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
@@ -549,10 +570,13 @@ async def get_index():
                         if (event.data.type === 'audio' && websocket.readyState === WebSocket.OPEN) {
                             const { data: audioData, rms, counter } = event.data;
                             
+                            // Update audio level display
+                            updateAudioLevel(rms);
+                            
                             // Debug logging
                             audioChunkCounter++;
-                            if (audioChunkCounter % 50 === 0) {  // Log every 50 chunks
-                                addDebugMessage(`Sent ${audioChunkCounter} audio chunks, RMS: ${rms.toFixed(4)}`);
+                            if (audioChunkCounter % 100 === 0) {
+                                console.log(`Sent ${audioChunkCounter} audio chunks, RMS: ${rms.toFixed(4)}`);
                             }
                             
                             // Convert to base64
@@ -568,15 +592,12 @@ async def get_index():
                     source.connect(audioWorkletNode);
                     audioWorkletNode.connect(audioContext.destination);
                     
-                    addDebugMessage('Audio processing pipeline connected');
-                    
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
                     
                 } catch (error) {
                     console.error('Error starting recording:', error);
                     updateStatus('Status: Error - ' + error.message, 'error');
-                    addDebugMessage('Error: ' + error.message);
                     alert('Error accessing microphone. Please check permissions and try again.');
                 }
             }
@@ -587,23 +608,21 @@ async def get_index():
                 if (audioWorkletNode) {
                     audioWorkletNode.disconnect();
                     audioWorkletNode = null;
-                    addDebugMessage('AudioWorklet disconnected');
                 }
                 
                 if (audioContext) {
                     audioContext.close();
                     audioContext = null;
-                    addDebugMessage('AudioContext closed');
                 }
                 
                 if (websocket) {
                     websocket.close();
-                    addDebugMessage('WebSocket closed');
                 }
                 
                 document.getElementById('startBtn').disabled = false;
                 document.getElementById('stopBtn').disabled = true;
                 updateStatus('Status: Stopped', 'stopped');
+                updateAudioLevel(0);
                 
                 // Reset counters
                 audioChunkCounter = 0;
