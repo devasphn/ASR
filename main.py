@@ -116,7 +116,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Updated audio processing functions
+# Audio processing functions
 def process_audio_chunk(audio_data: bytes) -> np.ndarray:
     """Process raw PCM audio data directly"""
     try:
@@ -124,7 +124,7 @@ def process_audio_chunk(audio_data: bytes) -> np.ndarray:
         audio_bytes = base64.b64decode(audio_data)
         
         # Convert raw PCM bytes to numpy array
-        # Assuming 16-bit PCM, mono, 16kHz (adjust as needed)
+        # Assuming 16-bit PCM, mono, 16kHz
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
         
         # Convert to float32 and normalize
@@ -368,10 +368,48 @@ async def get_index():
         
         <script>
             let audioContext;
-            let processor;
+            let audioWorkletNode;
+            let mediaStreamSource;
             let websocket;
             let clientId = 'client_' + Date.now();
             let isRecording = false;
+            
+            // AudioWorklet processor code
+            const processorCode = `
+                class AudioProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.port.onmessage = (event) => {
+                            if (event.data.type === 'init') {
+                                console.log('AudioWorklet initialized');
+                            }
+                        };
+                    }
+                    
+                    process(inputs, outputs, parameters) {
+                        const input = inputs[0];
+                        if (input.length > 0) {
+                            const inputData = input[0];
+                            
+                            // Convert float32 to int16
+                            const int16Array = new Int16Array(inputData.length);
+                            for (let i = 0; i < inputData.length; i++) {
+                                int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                            }
+                            
+                            // Send to main thread
+                            this.port.postMessage({
+                                type: 'audioData',
+                                data: int16Array
+                            });
+                        }
+                        
+                        return true;
+                    }
+                }
+                
+                registerProcessor('audio-processor', AudioProcessor);
+            `;
             
             // Auto-detect WebSocket URL based on current location
             function getWebSocketURL() {
@@ -390,6 +428,8 @@ async def get_index():
             
             async function startRecording() {
                 try {
+                    updateStatus('Status: Connecting...', 'recording');
+                    
                     // Get microphone access
                     const stream = await navigator.mediaDevices.getUserMedia({
                         audio: {
@@ -401,7 +441,19 @@ async def get_index():
                         }
                     });
                     
-                    updateStatus('Status: Connecting...', 'recording');
+                    // Create AudioContext
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: 16000
+                    });
+                    
+                    // Create AudioWorklet from blob
+                    const blob = new Blob([processorCode], { type: 'application/javascript' });
+                    const workletUrl = URL.createObjectURL(blob);
+                    
+                    await audioContext.audioWorklet.addModule(workletUrl);
+                    
+                    // Create AudioWorkletNode
+                    audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
                     
                     // Connect WebSocket
                     const wsUrl = getWebSocketURL();
@@ -436,30 +488,10 @@ async def get_index():
                         isRecording = false;
                     };
                     
-                    // Setup Web Audio API for PCM processing
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                        sampleRate: 16000
-                    });
-                    
-                    const source = audioContext.createMediaStreamSource(stream);
-                    
-                    // Create ScriptProcessorNode for raw PCM data
-                    processor = audioContext.createScriptProcessor(4096, 1, 1);
-                    
-                    processor.onaudioprocess = function(event) {
-                        if (websocket.readyState === WebSocket.OPEN) {
-                            const inputBuffer = event.inputBuffer;
-                            const inputData = inputBuffer.getChannelData(0);
-                            
-                            // Convert float32 to int16
-                            const int16Array = new Int16Array(inputData.length);
-                            for (let i = 0; i < inputData.length; i++) {
-                                int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
-                            }
-                            
-                            // Convert to base64
-                            const base64 = btoa(String.fromCharCode(...new Uint8Array(int16Array.buffer)));
-                            
+                    // Handle audio data from AudioWorklet
+                    audioWorkletNode.port.onmessage = function(event) {
+                        if (event.data.type === 'audioData' && websocket.readyState === WebSocket.OPEN) {
+                            const base64 = btoa(String.fromCharCode(...new Uint8Array(event.data.data.buffer)));
                             websocket.send(JSON.stringify({
                                 type: 'audio',
                                 data: base64
@@ -467,8 +499,12 @@ async def get_index():
                         }
                     };
                     
-                    source.connect(processor);
-                    processor.connect(audioContext.destination);
+                    // Set up audio processing chain
+                    mediaStreamSource = audioContext.createMediaStreamSource(stream);
+                    mediaStreamSource.connect(audioWorkletNode);
+                    
+                    // Initialize AudioWorklet
+                    audioWorkletNode.port.postMessage({ type: 'init' });
                     
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
@@ -483,9 +519,14 @@ async def get_index():
             function stopRecording() {
                 isRecording = false;
                 
-                if (processor) {
-                    processor.disconnect();
-                    processor = null;
+                if (mediaStreamSource) {
+                    mediaStreamSource.disconnect();
+                    mediaStreamSource = null;
+                }
+                
+                if (audioWorkletNode) {
+                    audioWorkletNode.disconnect();
+                    audioWorkletNode = null;
                 }
                 
                 if (audioContext) {
