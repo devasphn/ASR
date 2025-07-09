@@ -11,7 +11,7 @@ import logging
 from typing import Dict, List
 import base64
 import io
-import soundfile as sf
+import wave
 from pysilero_vad import SileroVoiceActivityDetector
 import queue
 import threading
@@ -19,9 +19,8 @@ import time
 from datetime import datetime
 import os
 from contextlib import asynccontextmanager
-from pydub import AudioSegment
+import struct
 import tempfile
-import librosa
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -117,33 +116,20 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Fixed audio processing functions
+# Updated audio processing functions
 def process_audio_chunk(audio_data: bytes) -> np.ndarray:
-    """Convert WebM audio bytes to numpy array for processing"""
+    """Process raw PCM audio data directly"""
     try:
         # Decode base64 audio data
         audio_bytes = base64.b64decode(audio_data)
         
-        # Create BytesIO object for pydub
-        audio_io = io.BytesIO(audio_bytes)
+        # Convert raw PCM bytes to numpy array
+        # Assuming 16-bit PCM, mono, 16kHz (adjust as needed)
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
         
-        # Use pydub to handle WebM/Opus format
-        audio_segment = AudioSegment.from_file(audio_io, format="webm")
+        # Convert to float32 and normalize
+        audio_array = audio_array.astype(np.float32) / 32768.0
         
-        # Convert to mono if stereo
-        if audio_segment.channels > 1:
-            audio_segment = audio_segment.set_channels(1)
-        
-        # Set sample rate to 16kHz
-        audio_segment = audio_segment.set_frame_rate(16000)
-        
-        # Convert to numpy array
-        audio_array = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
-        
-        # Normalize audio
-        if len(audio_array) > 0:
-            audio_array = audio_array / np.max(np.abs(audio_array))
-            
         return audio_array
         
     except Exception as e:
@@ -381,7 +367,8 @@ async def get_index():
         </div>
         
         <script>
-            let mediaRecorder;
+            let audioContext;
+            let processor;
             let websocket;
             let clientId = 'client_' + Date.now();
             let isRecording = false;
@@ -392,7 +379,6 @@ async def get_index():
                 const hostname = window.location.hostname;
                 const port = window.location.port ? ':' + window.location.port : '';
                 
-                // For RunPod proxy, use the same host with wss
                 return `${protocol}//${hostname}${port}/ws/${clientId}`;
             }
             
@@ -450,30 +436,39 @@ async def get_index():
                         isRecording = false;
                     };
                     
-                    // Setup MediaRecorder with WebM format
-                    const options = {
-                        mimeType: 'audio/webm;codecs=opus',
-                        audioBitsPerSecond: 16000
-                    };
+                    // Setup Web Audio API for PCM processing
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: 16000
+                    });
                     
-                    mediaRecorder = new MediaRecorder(stream, options);
+                    const source = audioContext.createMediaStreamSource(stream);
                     
-                    mediaRecorder.ondataavailable = function(event) {
-                        if (event.data.size > 0 && websocket.readyState === WebSocket.OPEN) {
-                            const reader = new FileReader();
-                            reader.onload = function() {
-                                const arrayBuffer = reader.result;
-                                const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-                                websocket.send(JSON.stringify({
-                                    type: 'audio',
-                                    data: base64
-                                }));
-                            };
-                            reader.readAsArrayBuffer(event.data);
+                    // Create ScriptProcessorNode for raw PCM data
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
+                    
+                    processor.onaudioprocess = function(event) {
+                        if (websocket.readyState === WebSocket.OPEN) {
+                            const inputBuffer = event.inputBuffer;
+                            const inputData = inputBuffer.getChannelData(0);
+                            
+                            // Convert float32 to int16
+                            const int16Array = new Int16Array(inputData.length);
+                            for (let i = 0; i < inputData.length; i++) {
+                                int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                            }
+                            
+                            // Convert to base64
+                            const base64 = btoa(String.fromCharCode(...new Uint8Array(int16Array.buffer)));
+                            
+                            websocket.send(JSON.stringify({
+                                type: 'audio',
+                                data: base64
+                            }));
                         }
                     };
                     
-                    mediaRecorder.start(1000); // Send data every 1 second
+                    source.connect(processor);
+                    processor.connect(audioContext.destination);
                     
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
@@ -488,9 +483,14 @@ async def get_index():
             function stopRecording() {
                 isRecording = false;
                 
-                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                    mediaRecorder.stop();
-                    mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                if (processor) {
+                    processor.disconnect();
+                    processor = null;
+                }
+                
+                if (audioContext) {
+                    audioContext.close();
+                    audioContext = null;
                 }
                 
                 if (websocket) {
